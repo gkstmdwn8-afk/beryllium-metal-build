@@ -27,7 +27,8 @@ jobs:
     steps:
       - name: Tools
         run: |
-          brew install glslang bison llvm ninja
+          brew install glslang shaderc bison llvm ninja
+          glslc --version | head -1
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
           rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
           xcodebuild -version
