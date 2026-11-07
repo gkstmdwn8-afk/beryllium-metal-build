@@ -46,6 +46,12 @@ jobs:
           mkdir -p "$ROOT/.cache/gpu-reference"
           git clone --filter=blob:none --branch development https://github.com/steelbrain/metal2vulkan.git "$ROOT/.cache/gpu-reference/metal2vulkan"
           git -C "$ROOT/.cache/gpu-reference/metal2vulkan" checkout --quiet "$M2V_COMMIT"
+          # GpuScanoutClient.h includes ../NativeMobileDisplay/NativeGOPWire.h, which lives in the device repository, not in
+          # the core. The public UniXNU-dipper copy is byte-identical to the beryllium one (sha256 f318da02...).
+          mkdir -p "$ROOT/drivers/NativeMobileDisplay"
+          curl -fsSL -o "$ROOT/drivers/NativeMobileDisplay/NativeGOPWire.h" \
+            https://raw.githubusercontent.com/hanyaa380/UniXNU-dipper/a7f7250a5efc72b571804e2b429d931c89a71e3c/drivers/NativeMobileDisplay/NativeGOPWire.h
+          echo "f318da02e91844eb6552584bee1e50081dff633d6238c0c97e83edd91dd7f779  $ROOT/drivers/NativeMobileDisplay/NativeGOPWire.h" | shasum -a 256 -c
 
       - name: Mesa (pinned, patched)
         run: |
