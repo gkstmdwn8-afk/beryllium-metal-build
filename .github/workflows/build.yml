@@ -58,14 +58,16 @@ jobs:
           python3 - <<'PY'
           import json, os, pathlib, re, subprocess
           root = os.environ['ROOT']
-          # turnip-darwin-perfetto-capture.patch adds two files without the "new file mode" line, which git apply (and the
-          # recorded-patch validator, which reverse-applies the same files) refuses. Add the line; the content is unchanged.
-          for p in pathlib.Path(root, 'patches/mesa').glob('*.patch'):
-              s = p.read_text()
-              n = re.sub(r'^(diff --git a/(\S+) b/\2\n)(--- /dev/null\n)', r'\1new file mode 100644\n\3', s, flags=re.M)
-              if n != s:
-                  p.write_text(n)
-                  print('added new file mode lines to', p.name)
+          # Some recorded patches (Mesa turnip-darwin-perfetto-capture, metal2vulkan bridge 0029) add files without the
+          # "new file mode" line, which git apply (and the recorded-patch validator, which reverse-applies the same files)
+          # refuses. Add the line; the content is unchanged.
+          for d in ('patches/mesa', 'drivers/AdrenoMetal/bridge/patches'):
+              for p in pathlib.Path(root, d).glob('*.patch'):
+                  s = p.read_text()
+                  n = re.sub(r'^(diff --git a/(\S+) b/\2\n)(--- /dev/null\n)', r'\1new file mode 100644\n\3', s, flags=re.M)
+                  if n != s:
+                      p.write_text(n)
+                      print('added new file mode lines to', p.name)
           for p in json.load(open(root + '/scripts/data/adreno-compiler-inputs.json'))['patches']:
               subprocess.run(['git', 'apply', root + '/' + p], check=True)
               print('applied', p)
