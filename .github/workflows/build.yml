@@ -20,6 +20,10 @@ jobs:
       ABI_COMMIT: 86e0f1b
       M2V_COMMIT: 624bab3918de5b978e1101517abca2b4fa426565
       ROOT: ${{ github.workspace }}/core
+    defaults:
+      run:
+        # Every step's output also goes to one log; on failure its tail is published as annotations (readable without login).
+        shell: bash --noprofile --norc -c "set -o pipefail; bash -e {0} 2>&1 | tee -a \"$RUNNER_TEMP/all.log\""
     steps:
       - name: Tools
         run: |
@@ -84,6 +88,21 @@ jobs:
           cp -R "$ROOT/build/adreno-metal-plugin" out/ 2>/dev/null || true
           find "$ROOT/build" "$ROOT/.cache" -maxdepth 3 -name "*.log" -exec cp {} out/ \; 2>/dev/null || true
           ls -laR out | head -80
+
+      - name: Failure log as annotations
+        if: failure()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          path = os.path.join(os.environ['RUNNER_TEMP'], 'all.log')
+          lines = open(path, errors='replace').read().splitlines()[-160:] if os.path.exists(path) else ['no log']
+          text = '\n'.join(l[-300:] for l in lines)
+          chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)][-8:]
+          for n, c in enumerate(chunks, 1):
+              c = c.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f'::error title=log tail {n}/{len(chunks)}::{c}')
+          PY
 
       - uses: actions/upload-artifact@v4
         if: always()
