@@ -25,6 +25,9 @@ jobs:
         # Every step's output also goes to one log; on failure its tail is published as annotations (readable without login).
         shell: bash --noprofile --norc -c "set -o pipefail; bash -e {0} 2>&1 | tee -a \"$RUNNER_TEMP/all.log\""
     steps:
+      # This repository's own files (patches/adrenometal); runs first, before core/ is cloned into the workspace.
+      - uses: actions/checkout@v4
+
       - name: Tools
         run: |
           brew install glslang shaderc bison llvm ninja
