@@ -1,0 +1,76 @@
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index b9b4a4d..6045799 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -300,6 +300,20 @@ static id deviceForPort(unsigned port) {
+             return nil;
+         }
+         gpu->mark(0x6802);
++        // beryllium: problems of this process's device, streamed to the kernel log (63 characters per line, longer texts in pieces).
++        {
++            static Gpu *streamGpu;
++            streamGpu = gpu;
++            native_bridge_metal_problem_hook = [](const char *what) {
++                if (!streamGpu || !what) return;
++                char piece[64];
++                const size_t length = strlen(what);
++                for (size_t at = 0, n = 0; at < length && n < 4; at += 58, ++n) {
++                    snprintf(piece, sizeof piece, "PB%zu %.58s", n, what + at);
++                    streamText(*streamGpu, piece);
++                }
++            };
++        }
+         // The monitor reports the runtime status every ten seconds.
+         pthread_t monitor;
+         pthread_attr_t attributes;
+diff --git a/NativeBridgeMetalFrontend.h b/NativeBridgeMetalFrontend.h
+index b72b10b..adec416 100644
+--- a/NativeBridgeMetalFrontend.h
++++ b/NativeBridgeMetalFrontend.h
+@@ -13,6 +13,7 @@ id native_bridge_metal_open(const char *loader, const char *cache, uint64_t regi
+ id native_bridge_metal_library_with_air(const void *bytes, size_t length);
+ // One line for the plugin's status report: command buffers committed/failed locally, pipelines made, refusals, the last refusal's text.
+ size_t native_bridge_metal_status(char *out, size_t size);
++extern void (*native_bridge_metal_problem_hook)(const char *);
+ // The pixel formats of the textures asked for (first eight distinct) and how many texture requests the runtime refused.
+ size_t native_bridge_metal_formats(char *out, size_t size);
+ size_t native_bridge_metal_telemetry(char *out, size_t size);
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 5138ece..171157e 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -59,12 +59,17 @@ struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t schedul
+ static CommitRecord gCommitRing[32];
+ static std::mutex gCommitLock;
+ static std::mutex gProblemLock;
++extern "C" {void (*native_bridge_metal_problem_hook)(const char *)=nullptr;}
+ static char gLastProblems[2][200];
+ static void noteProblem(NSString *what) {
+  gProblems++;
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
+  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
++ // beryllium: every problem also goes to the kernel log at once (the first 48, then every 100th): a process that dies right after a
++ // refusal never reaches the ten-second status line.
++ const uint64_t n=gProblems.load();
++ if(native_bridge_metal_problem_hook && (n<=48 || n%100==0))native_bridge_metal_problem_hook(gLastProblems[0]);
+ }
+ #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
+ // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
+@@ -1716,6 +1721,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
+  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
++ if(!handle && native_bridge_metal_problem_hook) {
++  // beryllium: which pipeline was refused (shader names, colour formats and blending, depth/stencil formats, samples).
++  char line[200];int at=snprintf(line,sizeof line,"RPD v=%.40s f=%.40s ds=%lu/%lu s=%lu",d.vertexFunction.name.UTF8String?:"-",
++      d.fragmentFunction.name.UTF8String?:"-",(unsigned long)d.depthAttachmentPixelFormat,(unsigned long)d.stencilAttachmentPixelFormat,
++      (unsigned long)d.rasterSampleCount);
++  for(unsigned i=0;i<8 && at>0 && at<(int)sizeof line;i++){MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];
++   if(a.pixelFormat==MTLPixelFormatInvalid)continue;
++   at+=snprintf(line+at,sizeof line-(size_t)at," c%u=%lu:%d",i,(unsigned long)a.pixelFormat,(int)a.blendingEnabled);}
++  native_bridge_metal_problem_hook(line);
++ }
+  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
+  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ }

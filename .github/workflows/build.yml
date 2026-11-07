@@ -40,6 +40,8 @@ jobs:
           git -C "$ROOT" checkout --quiet "$CORE_COMMIT"
           git -C "$ROOT" submodule update --init --filter=blob:none drivers/AdrenoMetal kits/AdrenoPM4
           test "$(git -C "$ROOT/drivers/AdrenoMetal" rev-parse HEAD)" = "$METAL_COMMIT"
+          # beryllium patches on the plugin (patches/adrenometal, applied in name order): diagnostics only, see each patch.
+          for p in "$GITHUB_WORKSPACE"/patches/adrenometal/*.patch; do git -C "$ROOT/drivers/AdrenoMetal" apply "$p"; echo "applied $(basename "$p")"; done
           git clone --filter=blob:none https://github.com/RigoLigoRLC/unixnu-adreno6xx.git abi
           git -C abi checkout --quiet "$ABI_COMMIT"
           test -f abi/NativeAdrenoABI.h
