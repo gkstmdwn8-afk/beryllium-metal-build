@@ -1,0 +1,187 @@
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 6045799..2dba491 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -154,6 +154,34 @@ static bool listedClient() {
+         if (!strcmp(name, "*") || !strcmp(name, self)) return true;
+     return false;
+ }
++// beryllium (s34): NativeAdrenoMetal.env beside the bundle, KEY=VALUE lines ('#' starts a comment), goes into this process's environment before
++// Turnip and the runtime read theirs, so a switch (TU_DEBUG, TU_AUTOTUNE_ALGO, TU_CMD_CS_INITIAL_KB, NMB_PIPELINE_WAITS, ...) is tried on
++// the phone without a rebuild. Only the GPU stack's own prefixes are taken, and a variable already set is kept; the board's TU_DEBUG default
++// is set after this, so the file's TU_DEBUG wins. Returns how many lines were taken.
++static unsigned loadEnvironmentFile() {
++    char path[1024];
++    if (!requestedPath("NativeAdrenoMetal.env", path, sizeof path)) return 0;
++    FILE *file = fopen(path, "r");
++    if (!file) return 0;
++    static const char *const prefixes[] = {"TU_", "IR3_", "FD_", "MESA_", "VK_", "METAL2VULKAN_", "M2V_", "NMB_"};
++    unsigned taken = 0;
++    char line[512];
++    while (fgets(line, sizeof line, file)) {
++        line[strcspn(line, "\r\n")] = 0;
++        char *key = line;
++        while (*key == ' ' || *key == '\t') ++key;
++        char *equals = strchr(key, '=');
++        if (*key == '#' || !equals || equals == key) continue;
++        *equals = 0;
++        bool allowed = false;
++        for (const char *prefix : prefixes) allowed = allowed || !strncmp(key, prefix, strlen(prefix));
++        for (const char *c = key; allowed && *c; ++c) allowed = (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_';
++        if (allowed && setenv(key, equals + 1, 0) == 0) ++taken;
++    }
++    fclose(file);
++    return taken;
++}
++static unsigned gEnvironmentTaken;
+ // A listed process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
+ // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
+ // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
+@@ -210,6 +238,7 @@ static id deviceForPort(unsigned port) {
+         if (tried) return device;
+         tried = true;
+         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
++        gEnvironmentTaken = loadEnvironmentFile();
+         // The board selects Turnip's render-pass and concurrent-binning options.
+         if (NATIVE_ADRENO_TURNIP_DEBUG[0]) {
+             setenv("TU_DEBUG", NATIVE_ADRENO_TURNIP_DEBUG, 0);
+@@ -222,6 +251,7 @@ static id deviceForPort(unsigned port) {
+         Gpu *gpu = makeGpu(port);
+         if (!gpu) return nil;
+         gpu->mark(0x6800);
++        if (gEnvironmentTaken) gpu->mark(0x6840 | (gEnvironmentTaken > 0x3f ? 0x3f : gEnvironmentTaken));   // NativeAdrenoMetal.env lines taken
+         char turnip[1024];
+         if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {gpu->mark(0x68f1); return nil;}
+         gpu->mark(0x6801);
+diff --git a/NativeBridgeMetalFrontend.h b/NativeBridgeMetalFrontend.h
+index adec416..559b47d 100644
+--- a/NativeBridgeMetalFrontend.h
++++ b/NativeBridgeMetalFrontend.h
+@@ -22,6 +22,8 @@ struct NmbShaderCacheStats;
+ bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);
+ bool native_bridge_metal_work_stats(uint64_t out[10]);
+ bool native_bridge_metal_synchronization_stats(uint64_t out[16]);
++// Microseconds since this process's newest commit (UINT64_MAX before the first): the plugin's telemetry waits while the render server draws.
++uint64_t native_bridge_metal_idle_us(void);
+ // Releases retained imports whose surface has no other local owner.
+ void native_bridge_metal_trim_surface_imports(void);
+ // The same fixed CPU, memory and pipeline workload on the tablet and the host, so their times compare directly (int-145): compute, first-touch
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 171157e..b1724e6 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -25,6 +25,7 @@
+ #include <dlfcn.h>
+ #include <execinfo.h>
+ #include <mach/mach.h>
++#include <mach-o/dyld.h>
+ #include "bridge/NativeMetalObjects.h"
+ #include "NativeBridgeMetalFrontend.h"
+ 
+@@ -55,6 +56,15 @@ static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
+ static Timed gTimeSurfaceFlush;
+ static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
+ struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
++// beryllium (s34): every commit's encode time (creation to commit) and commit-to-scheduled time (the runtime's recording, its waits for
++// pipelines still being made, and the kernel submission), split at 32 draws, with a histogram of the latter; the K/E rows keep only the
++// newest commits. The newest commit's time also tells the plugin's telemetry thread when the render server is busy.
++static Timed gTimeEncodeBig,gTimeEncodeSmall,gTimeScheduleBig,gTimeScheduleSmall;
++static std::atomic<uint64_t> gScheduleBuckets[5];   // < 16, < 33, < 66, < 133, >= 133 ms
++static std::atomic<uint64_t> gLastCommitUs;
++static void addTook(Timed &timed,uint64_t took) {
++ timed.count++;timed.total+=took;uint64_t seen=timed.slowest.load();while(took>seen && !timed.slowest.compare_exchange_weak(seen,took)){}
++}
+ struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
+ static CommitRecord gCommitRing[32];
+ static std::mutex gCommitLock;
+@@ -1145,6 +1155,8 @@ static void scheduled(void *context);
+ - (void)didSchedule {
+  {
+   const uint64_t took=nowUs()-self.committedUs;
++  addTook(encodedWork.draws>=32?gTimeScheduleBig:gTimeScheduleSmall,took);
++  gScheduleBuckets[took<16000?0:took<33000?1:took<66000?2:took<133000?3:4]++;
+   std::lock_guard<std::mutex> lock(gCommitLock);
+   CommitRecord &r=gCommitRing[self.commitIndex%32];
+   if(r.index==self.commitIndex)r.scheduledUs=took;
+@@ -1202,6 +1214,8 @@ static void scheduled(void *context);
+   CommitRecord &r=gCommitRing[index%32];
+   r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
+  }
++ addTook(encodedWork.draws>=32?gTimeEncodeBig:gTimeEncodeSmall,self.committedUs-createdUs);
++ gLastCommitUs=self.committedUs;
+  dispatch_group_enter(_handlers);
+  dispatch_group_enter(_schedulingHandlers);
+  @synchronized(gInFlight){[gInFlight addObject:self];}
+@@ -1870,6 +1884,10 @@ extern "C" bool native_bridge_metal_work_stats(uint64_t out[10]) {
+ extern "C" bool native_bridge_metal_synchronization_stats(uint64_t out[16]) {
+  return gDevice && nmb_device_synchronization_stats(gDevice,out);
+ }
++extern "C" uint64_t native_bridge_metal_idle_us(void) {
++ const uint64_t last=gLastCommitUs.load();
++ return last?nowUs()-last:UINT64_MAX;
++}
+ 
+ extern "C" size_t native_bridge_metal_status(char *out,size_t size) {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+@@ -2018,6 +2036,38 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+   char warning[200];size_t n=nmb_last_warning(warning,sizeof warning);
+   if(n){row("W %.86s",warning);if(n>86)row("Wb %.86s",warning+86);}
+  }
++ // beryllium (s34): whether the driver's pipeline records persist (loads and hits after a reboot; mismatched after a Turnip rebuild), every
++ // commit's encode and commit-to-scheduled time, and Turnip's BO reuse cache (tu_darwin_bo_cache_stats).
++ {
++  NmbShaderCacheStats c={};
++  if(gDevice && nmb_device_shader_cache_stats(gDevice,&c))
++   row("V drv ld%llu hit%llu miss%llu sv%llu tr%llu mm%llu | rej%llu rf%llu wf%llu ev%llu",(unsigned long long)c.driver_loads,
++    (unsigned long long)c.driver_hits,(unsigned long long)c.driver_misses,(unsigned long long)c.driver_saves,(unsigned long long)c.driver_truncated,
++    (unsigned long long)c.driver_mismatched,(unsigned long long)c.rejected,(unsigned long long)c.read_failures,(unsigned long long)c.write_failures,
++    (unsigned long long)c.evictions);
++  auto mean=[](const Timed &t){const uint64_t n=t.count.load();return (unsigned long long)(n?t.total.load()/n:0);};
++  row("Q enc32+ n=%llu avg=%lluus max=%llums | <32 n=%llu avg=%lluus max=%llums",(unsigned long long)gTimeEncodeBig.count.load(),mean(gTimeEncodeBig),
++   ms(gTimeEncodeBig.slowest.load()),(unsigned long long)gTimeEncodeSmall.count.load(),mean(gTimeEncodeSmall),ms(gTimeEncodeSmall.slowest.load()));
++  row("Q sch32+ n=%llu avg=%lluus max=%llums | <32 avg=%lluus | h%llu/%llu/%llu/%llu/%llu",(unsigned long long)gTimeScheduleBig.count.load(),
++   mean(gTimeScheduleBig),ms(gTimeScheduleBig.slowest.load()),mean(gTimeScheduleSmall),(unsigned long long)gScheduleBuckets[0].load(),
++   (unsigned long long)gScheduleBuckets[1].load(),(unsigned long long)gScheduleBuckets[2].load(),(unsigned long long)gScheduleBuckets[3].load(),
++   (unsigned long long)gScheduleBuckets[4].load());
++  // Turnip is loaded by the runtime with RTLD_LOCAL, so its export is found through its loaded image.
++  static void (*const boCacheStats)(uint64_t *)=[]()->void (*)(uint64_t *){
++   for(uint32_t i=0,count=_dyld_image_count();i<count;i++) {
++    const char *image=_dyld_get_image_name(i);
++    if(!image || !strstr(image,"libvulkan_freedreno"))continue;
++    void *handle=dlopen(image,RTLD_LAZY|RTLD_NOLOAD);
++    return handle?(void (*)(uint64_t *))dlsym(handle,"tu_darwin_bo_cache_stats"):nullptr;
++   }
++   return nullptr;
++  }();
++  if(boCacheStats) {
++   uint64_t b[8]={};boCacheStats(b);
++   row("B tu-bo elig%llu hit%llu put%llu ev%llu kept%lluk peak%lluk",(unsigned long long)b[0],(unsigned long long)b[1],(unsigned long long)b[2],
++    (unsigned long long)b[3],(unsigned long long)(b[5]>>10),(unsigned long long)(b[6]>>10));
++  }
++ }
+  {
+   std::lock_guard<std::mutex> lock(gProblemLock);
+   char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 84c3f6e..7e3f0b0 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -168,6 +168,18 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
+         // and writable textures can use images over their backing buffers at the existing row pitch.
+         options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
+         options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
++        // beryllium (s34), an experiment, off unless set (NativeAdrenoMetal.env): NMB_PIPELINE_WAITS=bounded[:MS] lets a state's creation
++        // and a commit go on after MS milliseconds (50 by default) instead of waiting for a pipeline the driver is still making; that
++        // command buffer then drops the draws of the pipelines not made yet (the runtime's draw-dropped-still-making), and later ones
++        // draw them. A layer the render server renders once and keeps can keep the missing draw, so this is for measuring the stalls.
++        if let Ok(value) = std::env::var("NMB_PIPELINE_WAITS") {
++            if let Some(rest) = value.strip_prefix("bounded") {
++                let ms = rest.strip_prefix(':').and_then(|text| text.parse::<u64>().ok()).unwrap_or(50);
++                options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Bounded;
++                options.policy.pipeline_creation_wait = std::time::Duration::from_millis(ms);
++                options.policy.pipeline_commit_wait = std::time::Duration::from_millis(ms);
++            }
++        }
+ 
+         let device = Device::system_default_with(&options).map_err(e("device"))?;
+         metal2vulkan_runtime::shader_capture::start(&device);
