@@ -5,9 +5,16 @@
 #   unixnu-adreno6xx 86e0f1b   NativeAdrenoABI.h of the beryllium kernel (byte-identical to package/gpu/core)
 #   Mesa             85fda3b3  + unixnu-core patches/mesa (applied in the recorded order)
 #   metal2vulkan     624bab39  (patched by build-adreno-metal-bridge.py itself)
+# Our own changes on top: patches/adrenometal (the plugin) and patches/mesa (Turnip, appended to the recorded Mesa patch list).
 name: build-metal-plugin
 on:
   workflow_dispatch:
+    inputs:
+      mesa_patches:
+        description: "beryllium Turnip patches (patches/mesa): on or off"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
   push:
     branches: [main]
 jobs:
@@ -19,6 +26,8 @@ jobs:
       METAL_COMMIT: c31037dc6e01593ba93a8973a488a88b6188b349
       ABI_COMMIT: 86e0f1b
       M2V_COMMIT: 624bab3918de5b978e1101517abca2b4fa426565
+      # A push has no inputs: the patches are on.
+      BERYLLIUM_MESA_PATCHES: ${{ inputs.mesa_patches || 'on' }}
       ROOT: ${{ github.workspace }}/core
     defaults:
       run:
@@ -43,7 +52,7 @@ jobs:
           git -C "$ROOT" checkout --quiet "$CORE_COMMIT"
           git -C "$ROOT" submodule update --init --filter=blob:none drivers/AdrenoMetal kits/AdrenoPM4
           test "$(git -C "$ROOT/drivers/AdrenoMetal" rev-parse HEAD)" = "$METAL_COMMIT"
-          # beryllium patches on the plugin (patches/adrenometal, applied in name order): diagnostics only, see each patch.
+          # beryllium patches on the plugin (patches/adrenometal, applied in name order): diagnostics and opt-in switches, see each patch.
           for p in "$GITHUB_WORKSPACE"/patches/adrenometal/*.patch; do git -C "$ROOT/drivers/AdrenoMetal" apply "$p"; echo "applied $(basename "$p")"; done
           git clone --filter=blob:none https://github.com/RigoLigoRLC/unixnu-adreno6xx.git abi
           git -C abi checkout --quiet "$ABI_COMMIT"
@@ -79,7 +88,17 @@ jobs:
                   if n != s:
                       p.write_text(n)
                       print('added new file mode lines to', p.name)
-          for p in json.load(open(root + '/scripts/data/adreno-compiler-inputs.json'))['patches']:
+          # beryllium's Turnip patches (this repository's patches/mesa, in name order) join the end of the recorded list, so
+          # build-turnip-darwin.py's patch check and its source identity cover them as they cover the recorded ones.
+          inputs = root + '/scripts/data/adreno-compiler-inputs.json'
+          pins = json.load(open(inputs))
+          if os.environ.get('BERYLLIUM_MESA_PATCHES', 'on') != 'off':
+              for p in sorted(pathlib.Path(os.environ['GITHUB_WORKSPACE'], 'patches/mesa').glob('*.patch')):
+                  pathlib.Path(root, 'patches/mesa', p.name).write_bytes(p.read_bytes())
+                  pins['patches'].append('patches/mesa/' + p.name)
+              with open(inputs, 'w') as f:
+                  json.dump(pins, f, indent=2)
+          for p in pins['patches']:
               subprocess.run(['git', 'apply', root + '/' + p], check=True)
               print('applied', p)
           PY

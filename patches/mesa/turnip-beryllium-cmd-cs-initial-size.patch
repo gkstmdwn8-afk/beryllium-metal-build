@@ -1,0 +1,49 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index ff4a313..20504d1 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -4363,6 +4363,32 @@ static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
+       u_trace_end_iterator(&cmd_buffer->rp_trace);
+ }
+ 
++/* beryllium: the size of a primary command buffer's first "cmd cs" BO.
++ * Upstream starts it at 4096 dwords (16 KiB) and doubles it at each overflow;
++ * on the Darwin kernel backend every new BO is a kernel allocation that took
++ * 10-300 ms while the render server drew, and the BO reuse cache only hands
++ * out a BO of the same size class, so the doubling sizes (16 KiB to 512 KiB)
++ * mostly missed it (reason 2, size).
++ * TU_CMD_CS_INITIAL_KB (16 to 2048 KiB, default 256; 16 is upstream) sets the
++ * first BO's size. Secondaries (many per frame, few cmd cs packets) keep
++ * upstream's size. The BO is still made only when the stream is first
++ * written, and a reset keeps the last one, as before.
++ */
++static uint32_t
++tu_cmd_cs_initial_dwords(void)
++{
++   static const uint32_t dwords = [] {
++      const char *text = getenv("TU_CMD_CS_INITIAL_KB");
++      unsigned long kb = text && *text ? strtoul(text, NULL, 10) : 256;
++      if (kb < 16)
++         kb = 16;
++      if (kb > 2048)
++         kb = 2048;
++      return (uint32_t) (kb * 1024 / sizeof(uint32_t));
++   }();
++   return dwords;
++}
++
+ static VkResult
+ tu_create_cmd_buffer(struct vk_command_pool *pool,
+                      VkCommandBufferLevel level,
+@@ -4403,7 +4429,10 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
+       }
+    }
+ 
+-   tu_cs_init(&cmd_buffer->cs, device, TU_CS_MODE_GROW, 4096, "cmd cs");
++   tu_cs_init(&cmd_buffer->cs, device, TU_CS_MODE_GROW,
++              level == VK_COMMAND_BUFFER_LEVEL_PRIMARY ?
++                 tu_cmd_cs_initial_dwords() : 4096,
++              "cmd cs");
+    tu_cs_init(&cmd_buffer->draw_cs, device, TU_CS_MODE_GROW, 4096, "draw cs");
+    tu_cs_init(&cmd_buffer->tile_store_cs, device, TU_CS_MODE_GROW, 2048, "tile store cs");
+    tu_cs_init(&cmd_buffer->draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "draw epilogue cs");
