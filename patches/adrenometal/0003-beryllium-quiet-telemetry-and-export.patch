@@ -1,0 +1,72 @@
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 2dba491..09a3e1c 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -390,18 +390,39 @@ static id deviceForPort(unsigned port) {
+             sleep(5);
+             // The bridge's telemetry table, resent whole every four seconds as markers (two characters each): 0xC000|row starts a row of the
+             // kernel's table, 0x8000|(a<<7)|b appends two characters. Rows are at most 90 characters; 48 rows.
++            // beryllium (s34): every marker is one IOServiceOpen/IOServiceClose pair, so the whole table (about 1,500 pairs back to back)
++            // every six seconds competed with the render server's own kernel calls (BO allocation, imports, submission) while it drew.
++            // A row the kernel already holds unchanged is not sent again; the whole table still goes out every tenth send; and a period
++            // in which the render server committed in the last two seconds is skipped, unless the last send is 30 s old. The file
++            // NativeAdrenoMetal.telemetry-legacy beside the bundle restores the old whole table every six seconds.
++            char legacyPath[1024];
++            const bool legacy = requestedPath("NativeAdrenoMetal.telemetry-legacy", legacyPath, sizeof legacyPath);
++            static char sent[48][91];
++            uint64_t lastSend = 0;
++            unsigned sends = 0;
+             for (;;) {
++                const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
++                if (!legacy && native_bridge_metal_idle_us() < 2000000 && lastSend && now - lastSend < 30000000) {
++                    sleep(6);
++                    continue;
++                }
++                const bool whole = legacy || sends++ % 10 == 0;
++                lastSend = now;
+                 static char table[6144];
+                 native_bridge_metal_telemetry(table, sizeof table);
+                 unsigned row = 0;
+                 for (char *line = table; *line && row < 48;) {
+                     char *end = strchr(line, '\n');
+                     if (end) *end = 0;
+-                    g->mark(0xC000u | row);
+                     const size_t length = strlen(line) < 90 ? strlen(line) : 90;
+-                    for (size_t i = 0; i < length; i += 2) {
+-                        const unsigned a = (unsigned char)line[i] & 0x7f, b = i + 1 < length ? (unsigned char)line[i + 1] & 0x7f : 0;
+-                        g->mark(0x8000u | (a << 7) | b);
++                    if (whole || strlen(sent[row]) != length || memcmp(sent[row], line, length) != 0) {
++                        g->mark(0xC000u | row);
++                        for (size_t i = 0; i < length; i += 2) {
++                            const unsigned a = (unsigned char)line[i] & 0x7f, b = i + 1 < length ? (unsigned char)line[i + 1] & 0x7f : 0;
++                            g->mark(0x8000u | (a << 7) | b);
++                        }
++                        memcpy(sent[row], line, length);
++                        sent[row][length] = 0;
+                     }
+                     ++row;
+                     if (!end) break;
+@@ -424,11 +445,18 @@ static id deviceForPort(unsigned port) {
+             return nullptr;
+         }, gpu);
+ #endif
+-        pthread_t exporter;
+-        pthread_create(&exporter, &attributes, [](void *arg) -> void * {
+-            cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
+-            return nullptr;
+-        }, gpu);
++        // beryllium (s34): the export to the kernel's UFS log is for a board whose Data is a RAM disk. beryllium's cache directory persists
++        // (marker 6814), its kernel never took an export (6902 never seen, 69f3 every period), and each period rescanned the whole
++        // directory. It runs only when NativeAdrenoMetal.cache-export is beside the bundle (marker 6880: not requested).
++        if (char exportPath[1024]; requestedPath("NativeAdrenoMetal.cache-export", exportPath, sizeof exportPath)) {
++            pthread_t exporter;
++            pthread_create(&exporter, &attributes, [](void *arg) -> void * {
++                cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
++                return nullptr;
++            }, gpu);
++        } else {
++            gpu->mark(0x6880);
++        }
+         // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
+         // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
+         // The translator recurses deeply on large functions: give it the stack of a main thread.
